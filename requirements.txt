@@ -20,3 +20,11 @@ pymupdf4llm>=0.0.17
 python-dotenv>=1.0.0
 
 azure-storage-blob>=12.0.0
+# API + chat UI
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+streamlit>=1.40.0
+requests>=2.32.0
+
+# Azure Table Storage (document registry)
+azure-data-tables>=12.5.0

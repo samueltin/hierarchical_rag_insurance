@@ -1,26 +1,28 @@
 """
 rag_retriever.py
 
-RAG query engine using the parent-child index built by doc_intell.py.
+RAG query engine using the parent-child index built by the ingestion pipeline.
 
 Query time flow:
-  1. Embed user query via Azure OpenAI
+  0. Condense a follow-up into a standalone question (multi-turn only)
+  1. Embed the query via Azure OpenAI
   2. Vector search Azure AI Search  →  top matching child chunks
-  3. Extract parent_ids from results (deduplicated)
-  4. Fetch parent JSON blobs from Azure Blob Storage
+  3. Extract parent blob URLs from results (deduplicated)
+  4. Fetch those parent JSON blobs from Azure Blob Storage
   5. Build context from parent content + section metadata
-  6. Pass context + question to LLM and return answer
+  6. Pass context + question to LLM and return the answer with its sources
 """
 
 import os
-import json
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
-from azure.storage.blob import BlobServiceClient
 from azure.identity import DefaultAzureCredential
+
+from storage import download_json, parse_blob_url
 
 load_dotenv()
 
@@ -33,9 +35,6 @@ AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 EMBEDDING_DEPLOYMENT     = os.getenv("EMBEDDING_DEPLOYMENT", "text-embedding-ada-002")
 CHAT_DEPLOYMENT          = os.getenv("CHAT_DEPLOYMENT", "gpt-4o")
 
-BLOB_CONNECTION_STRING   = os.getenv("BLOB_CONNECTION_STRING")
-BLOB_CONTAINER_NAME      = os.getenv("BLOB_CONTAINER_NAME", "parent-chunks")
-
 SEARCH_ENDPOINT          = os.getenv("AZURE_SEARCH_ENDPOINT")
 SEARCH_INDEX_NAME        = os.getenv("AZURE_SEARCH_INDEX_NAME", "breakdown-child-chunks")
 
@@ -45,10 +44,12 @@ TOP_K = 5  # number of child chunks to retrieve per query
 # Core retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve_parent_chunks(query: str) -> list[dict]:
+def retrieve_parent_chunks(query: str, document_name: str | None = None) -> list[dict]:
     """
     Embed query -> vector search child chunks -> fetch parent blobs.
     Returns a list of parent dicts: {parent_id, content, metadata}.
+
+    Pass `document_name` to scope the search to a single ingested document.
     """
 
     # 1. Embed the query
@@ -75,91 +76,277 @@ def retrieve_parent_chunks(query: str) -> list[dict]:
     results = list(search_client.search(
         search_text=query,           # hybrid: keyword + vector search combined
         vector_queries=[vector_query],
-        select=["child_id", "parent_id", "content",
+        filter=f"document_name eq '{document_name}'" if document_name else None,
+        select=["child_id", "parent_id", "parent_path", "document_name", "content",
                 "meta_h1", "meta_h2", "meta_h3", "meta_h4"],
         top=TOP_K,
     ))
 
-    # 3. Deduplicate parent_ids — multiple children may share a parent
-    seen = set()
-    parent_ids = []
+    # 3. Group children by parent, adding up their scores.
+    #
+    #    Ranking parents by their best single child favours short chunks: a
+    #    108-character cross-reference that is almost entirely query terms
+    #    out-scores the 420-character section that answers the question, on both
+    #    keyword and vector search. A parent whose children match repeatedly is
+    #    the better bet, so the scores are summed.
+    matches: dict[str, dict] = {}
     for r in results:
-        pid = r["parent_id"]
-        if pid not in seen:
-            seen.add(pid)
-            parent_ids.append(pid)
+        # The ingestion pipeline stamps each child with its parent's blob URL, so
+        # query time does not need to know how the pipeline lays out storage.
+        path = r.get("parent_path")
+        if not path:
+            print(f"      Skipping chunk {r['child_id']}: no parent_path "
+                  f"(indexed before the ingestion pipeline refactor)")
+            continue
+        score = r.get("@search.score", 0.0)
+        match = matches.setdefault(path, {"score": 0.0, "hits": 0, "best": score})
+        match["score"] += score
+        match["hits"] += 1
+        match["best"] = max(match["best"], score)
 
-    # 4. Fetch parent blobs from Azure Blob Storage
-    blob_service = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
-    container_client = blob_service.get_container_client(BLOB_CONTAINER_NAME)
+    ranked = sorted(matches.items(), key=lambda kv: kv[1]["score"], reverse=True)
 
+    # 4. Fetch parent blobs from Azure Blob Storage, keeping the URL each came
+    #    from so the caller can cite it.
     parents = []
-    for parent_id in parent_ids:
-        blob_client = container_client.get_blob_client(f"{parent_id}.json")
-        data = blob_client.download_blob().readall()
-        parents.append(json.loads(data))
-
+    for path, match in ranked:
+        parent = download_json(parse_blob_url(path))
+        parent["parent_path"] = path
+        parent["score"] = round(match["score"], 5)
+        parent["hits"] = match["hits"]
+        parents.append(parent)
     return parents
 
 
+def breadcrumb_of(parent: dict) -> str:
+    """"Your Cover > Section A. Roadside" from a parent chunk's heading metadata."""
+    meta = parent.get("metadata", {})
+    return " > ".join(
+        v for v in [
+            meta.get("H1", ""),
+            meta.get("H2", ""),
+            meta.get("H3", ""),
+            meta.get("H4", ""),
+        ] if v
+    )
+
+
 def build_context(parents: list[dict]) -> str:
-    """Format parent chunks into a readable context block for the LLM."""
-    sections = []
-    for p in parents:
-        meta = p.get("metadata", {})
-        # Build a breadcrumb from available heading levels
-        breadcrumb = " > ".join(
-            v for v in [
-                meta.get("H1", ""),
-                meta.get("H2", ""),
-                meta.get("H3", ""),
-                meta.get("H4", ""),
-            ] if v
+    """
+    Format parent chunks into a context block, grouped by policy document.
+
+    The corpus holds several policies that share section names — each has its
+    own "Cancellation rights", "Complaints procedure" and "General exclusions".
+    Presenting the sections as one flat list invites the model to merge rules
+    from different policies into a single answer with the wrong numbers, so
+    every section is labelled with the document it came from.
+    """
+    by_document: dict[str, list[dict]] = {}
+    for parent in parents:
+        by_document.setdefault(parent.get("document_name") or "unknown", []).append(parent)
+
+    blocks = []
+    for document_name, items in by_document.items():
+        lines = [f"## Policy document: {document_name}"]
+        for parent in items:
+            breadcrumb = breadcrumb_of(parent)
+            lines.append(f"[{document_name} › {breadcrumb or 'General'}]\n{parent['content']}")
+        blocks.append("\n\n".join(lines))
+    return "\n\n---\n\n".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Result types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Source:
+    """One parent chunk that fed the answer."""
+
+    section: str          # heading breadcrumb, e.g. "Your Cover > Section A. Roadside"
+    document_name: str
+    parent_id: str
+    parent_path: str      # blob URL of the parent chunk
+    content: str          # the parent chunk text the answer was drawn from
+    chars: int
+    score: float = 0.0    # combined search score of this parent's matching chunks
+    hits: int = 0         # how many of its child chunks matched
+
+    def __str__(self) -> str:
+        return (f"{self.section or '(no heading)'} "
+                f"[{self.document_name}, {self.chars} chars, score {self.score:.4f}]")
+
+    @classmethod
+    def from_parent(cls, parent: dict) -> "Source":
+        content = parent.get("content", "")
+        return cls(
+            section=breadcrumb_of(parent),
+            document_name=parent.get("document_name", ""),
+            parent_id=parent.get("parent_id", ""),
+            parent_path=parent.get("parent_path", ""),
+            content=content,
+            chars=len(content),
+            score=parent.get("score", 0.0),
+            hits=parent.get("hits", 0),
         )
-        header = f"[{breadcrumb}]" if breadcrumb else "[General]"
-        sections.append(f"{header}\n{p['content']}")
-    return "\n\n---\n\n".join(sections)
+
+
+@dataclass
+class RagAnswer:
+    """
+    An answer together with the policy sections it was drawn from.
+
+    Stringifies to the answer text, so `print(answer)` still shows just the answer.
+    """
+
+    answer: str
+    query: str = ""
+    # What retrieval actually searched on — differs from `query` when a
+    # follow-up was condensed. Recorded so a bad answer can be traced to the
+    # condenser or to the search, rather than guessed at.
+    search_query: str = ""
+    sources: list[Source] = field(default_factory=list)
+
+    def __str__(self) -> str:
+        return self.answer
+
+    def cited(self) -> str:
+        """Answer followed by a numbered source list."""
+        if not self.sources:
+            return self.answer
+        lines = [self.answer, "", "Sources:"]
+        lines += [f"  [{i}] {s}" for i, s in enumerate(self.sources, 1)]
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn support
+# ---------------------------------------------------------------------------
+
+def chat_model(temperature: float = 0) -> AzureChatOpenAI:
+    return AzureChatOpenAI(
+        azure_deployment=CHAT_DEPLOYMENT,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        azure_ad_token_provider=lambda: DefaultAzureCredential()
+            .get_token("https://cognitiveservices.azure.com/.default").token,
+        api_version=AZURE_OPENAI_API_VERSION,
+        temperature=temperature,
+    )
+
+
+def format_history(history: list[dict], limit: int = 6) -> str:
+    """Recent turns as plain text. Only the words — never the retrieved chunks."""
+    recent = history[-limit * 2:] if limit else history
+    return "\n".join(
+        f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '').strip()}"
+        for m in recent
+        if m.get("content")
+    )
+
+
+def condense_query(query: str, history: list[dict]) -> str:
+    """
+    Rewrite a follow-up into a question that stands on its own.
+
+    Vector search sees only the text it is given, so "what about in Europe?"
+    retrieves near-randomly: none of the words that identify the subject are in
+    it. Condensing against the recent turns is what makes turn two onwards work.
+
+    The opposite failure matters just as much — when the user genuinely changes
+    subject, dragging the previous policy into the query sends the search to the
+    wrong document — so the model is told to leave self-contained questions be.
+    """
+    if not history:
+        return query
+
+    prompt = f"""Given the conversation below, rewrite the user's latest message as a
+standalone question that can be understood with no other context.
+
+Rules:
+- Resolve pronouns and references ("it", "that section", "what about X") using the conversation.
+- Name the policy document or subject the question is about, when the conversation makes it clear.
+- If the latest message is ALREADY self-contained, or changes to a new subject,
+  return it unchanged.
+- Return only the rewritten question. No preamble, no quotes.
+
+Conversation:
+{format_history(history)}
+
+Latest message: {query}
+
+Standalone question:"""
+
+    try:
+        rewritten = chat_model().invoke(prompt).content.strip()
+    except Exception:
+        return query        # a condensation failure must not lose the question
+    return rewritten or query
 
 
 # ---------------------------------------------------------------------------
 # RAG answer
 # ---------------------------------------------------------------------------
 
-def answer_question(query: str, verbose: bool = False) -> str:
-    """Full RAG chain: retrieve parent chunks -> LLM answer."""
+def answer_question(query: str, verbose: bool = False,
+                    document_name: str | None = None,
+                    history: list[dict] | None = None,
+                    condense: bool = True) -> RagAnswer:
+    """
+    Full RAG chain: condense -> retrieve parent chunks -> LLM answer.
 
-    parents = retrieve_parent_chunks(query)
+    `history` is a list of {"role", "content"} dicts, oldest first. Pass it to
+    answer follow-up questions; it is used both to condense the search query and
+    to give the model the conversation so far.
+
+    `condense=False` searches on the raw message instead — useful for comparing
+    retrieval with and without condensation.
+
+    Returns a RagAnswer carrying the answer, the sections it came from, and the
+    query actually searched on.
+    """
+    history = history or []
+    search_query = condense_query(query, history) if (condense and history) else query
+
+    if verbose and search_query != query:
+        print(f"\n  Condensed: {query!r} -> {search_query!r}")
+
+    parents = retrieve_parent_chunks(search_query, document_name)
+    sources = [Source.from_parent(p) for p in parents]
 
     if not parents:
-        return "No relevant content found in the policy document."
+        return RagAnswer(
+            answer="No relevant content found in the policy documents.",
+            query=query,
+            search_query=search_query,
+        )
 
     if verbose:
         print(f"\n  Retrieved {len(parents)} parent chunk(s):")
-        for p in parents:
-            meta = p.get("metadata", {})
-            breadcrumb = " > ".join(v for v in [
-                meta.get("H1", ""), meta.get("H2", ""),
-                meta.get("H3", ""), meta.get("H4", ""),
-            ] if v)
-            print(f"    - {breadcrumb or '(no heading)'} "
-                  f"[{len(p['content'])} chars]")
+        for source in sources:
+            print(f"    - {source}")
 
     context = build_context(parents)
-
-    llm = AzureChatOpenAI(
-        azure_deployment=CHAT_DEPLOYMENT,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        azure_ad_token_provider=lambda: DefaultAzureCredential()
-            .get_token("https://cognitiveservices.azure.com/.default").token,
-        api_version=AZURE_OPENAI_API_VERSION,
-        temperature=0,
+    conversation = format_history(history)
+    conversation_block = (
+        f"\nConversation so far (for resolving what the question refers to):\n"
+        f"{conversation}\n"
+        if conversation else ""
     )
 
-    prompt = f"""You are a helpful assistant for RAC Breakdown Cover policy questions.
+    llm = chat_model()
+
+    prompt = f"""You are a helpful assistant answering questions about insurance policy documents.
 Answer the question using ONLY the policy context provided below.
 If the answer is not in the context, say "I don't have enough information to answer that."
-Be concise and cite the section name where relevant.
 
+The context may come from more than one policy document, grouped below under
+"Policy document:" headings. When it does:
+- Say which policy document each fact comes from.
+- If the documents give different answers, present them separately. Never merge
+  rules from different policies into a single figure or procedure.
+
+Be concise and cite the document and section name where relevant.
+{conversation_block}
 Context:
 {context}
 
@@ -168,7 +355,8 @@ Question: {query}
 Answer:"""
 
     response = llm.invoke(prompt)
-    return response.content
+    return RagAnswer(answer=response.content, query=query,
+                     search_query=search_query, sources=sources)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +379,9 @@ if __name__ == "__main__":
 
     for q in questions:
         print(f"\nQ: {q}")
-        answer = answer_question(q, verbose=True)
-        print(f"A: {answer}")
+        result = answer_question(q, verbose=True)
+        print(f"A: {result.answer}")
+        for i, source in enumerate(result.sources, 1):
+            print(f"   [{i}] {source.section or '(no heading)'}")
+            print(f"       {source.parent_path}")
         print("-" * 60)
