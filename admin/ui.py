@@ -12,7 +12,7 @@ import os
 import requests
 import streamlit as st
 
-API_URL = os.getenv("ADMIN_API_URL", "http://localhost:8200")
+API_URL = os.getenv("ADMIN_API_URL", "http://localhost:8100")
 REQUEST_TIMEOUT = 120
 
 st.set_page_config(page_title="Doc Admin Console", page_icon="🗂️", layout="wide")
