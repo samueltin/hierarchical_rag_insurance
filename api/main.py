@@ -64,6 +64,8 @@ class SourceModel(BaseModel):
     chars: int
     score: float = 0.0
     hits: int = 0
+    cited: bool = False
+    cite_order: int = -1
 
 
 class AskResponse(BaseModel):
@@ -71,6 +73,9 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[SourceModel]
     conversation_id: str | None = None
+    sufficient: bool = Field(
+        True, description="False when the retrieved sections did not answer the question"
+    )
     search_query: str = Field(
         "", description="What retrieval searched on; differs when a follow-up was condensed"
     )
@@ -274,6 +279,8 @@ def ask(request: AskRequest) -> AskResponse:
                         parent_path=s.parent_path,
                         score=s.score,
                         hits=s.hits,
+                        cited=s.cited,
+                        cite_order=s.cite_order,
                     )
                     for s in result.sources
                 ],
@@ -293,6 +300,7 @@ def ask(request: AskRequest) -> AskResponse:
         sources=[SourceModel(**vars(source)) for source in result.sources],
         conversation_id=request.conversation_id,
         search_query=result.search_query,
+        sufficient=result.sufficient,
         groundedness=verdict,
     )
 

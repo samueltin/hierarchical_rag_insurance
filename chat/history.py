@@ -69,6 +69,19 @@ class SourceRef:
     parent_path: str = ""
     score: float = 0.0     # combined score of this parent's matching chunks
     hits: int = 0          # how many child chunks matched
+    cited: bool = False    # the answer named this section as its source
+    cite_order: int = -1   # 0 = cited first in the answer, -1 = not cited
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "SourceRef":
+        """
+        Build from stored JSON, ignoring keys this version does not know.
+
+        Transcripts outlive the code that wrote them: a field added later must
+        not make an older reader fail on the whole conversation.
+        """
+        known = cls.__dataclass_fields__
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
 
 @dataclass
@@ -87,7 +100,7 @@ class Message:
             role=raw.get("role", ""),
             content=raw.get("content", ""),
             ts=raw.get("ts", ""),
-            sources=[SourceRef(**s) for s in raw.get("sources", [])],
+            sources=[SourceRef.from_dict(s) for s in raw.get("sources", [])],
             document_name=raw.get("document_name", ""),
             search_query=raw.get("search_query", ""),
             groundedness=raw.get("groundedness", {}) or {},

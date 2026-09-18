@@ -115,9 +115,17 @@ def render_sources(sources: list[dict], key: str) -> None:
         st.info("No sources returned.")
         return
 
-    best = sources[0]           # sources come back best match first
+    # Every section the answer cites stays in the panel, in the order the model
+    # ranked them; only sections it did not use go in the expander. Picking a
+    # single "best" meant a section the answer genuinely relied on could end up
+    # hidden among the ones it ignored.
+    cited = sorted((s for s in sources if s.get("cited")),
+                   key=lambda s: s.get("cite_order", 0))
+    best = cited[0] if cited else sources[0]
+    also_cited = [s for s in cited if s is not best]
+    others = [s for s in sources if s is not best and s not in cited]
     content = source_text(best)
-    st.caption("Top matching section")
+    st.caption("Section the answer cites" if best.get("cited") else "Top matching section")
     st.markdown(f"**{best.get('section') or '(no heading)'}**")
     detail = [best.get("document_name", "")]
     if content:
@@ -128,21 +136,39 @@ def render_sources(sources: list[dict], key: str) -> None:
         detail.append(f"score {best['score']:.4f}")
     st.caption(" · ".join(d for d in detail if d))
     if content:
+        # Key on the chunk itself, not the message position. Keyed widgets keep
+        # their session_state value across reruns, so a key like "chunk_3" would
+        # show the previous conversation's text after switching chats.
+        widget_key = f"chunk_{key}_{best.get('parent_id') or best.get('parent_path', '')[-24:]}"
         st.text_area("Chunk text", value=content, height=240,
-                     label_visibility="collapsed", key=f"chunk_{key}")
+                     label_visibility="collapsed", key=widget_key)
     else:
         st.caption("Chunk text unavailable.")
     if best.get("parent_path"):
         st.caption(f"[parent chunk blob]({best['parent_path']})")
 
-    if len(sources) > 1:
-        with st.expander(f"{len(sources) - 1} other section(s) retrieved"):
-            for other in sources[1:]:
+    for extra in also_cited:
+        with st.expander(f"Also cited · {extra.get('section') or '(no heading)'}", expanded=False):
+            st.caption(" · ".join(d for d in [
+                extra.get("document_name", ""),
+                f"{extra['hits']} chunk(s)" if extra.get("hits") else "",
+                f"score {extra['score']:.4f}" if extra.get("score") else "",
+            ] if d))
+            extra_text = source_text(extra)
+            if extra_text:
+                st.text(extra_text[:1500] + ("…" if len(extra_text) > 1500 else ""))
+            if extra.get("parent_path"):
+                st.caption(f"[parent chunk blob]({extra['parent_path']})")
+
+    if others:
+        with st.expander(f"{len(others)} other section(s) retrieved, not cited"):
+            for other in others:
                 st.markdown(f"**{other.get('section') or '(no heading)'}**")
                 st.caption(" · ".join(d for d in [
                     other.get("document_name", ""),
                     f"{other['hits']} chunk(s)" if other.get("hits") else "",
                     f"score {other['score']:.4f}" if other.get("score") else "",
+                    "cited" if other.get("cited") else "",
                 ] if d))
                 other_text = source_text(other)
                 if other_text:

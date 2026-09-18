@@ -14,8 +14,10 @@ Query time flow:
 """
 
 import os
+import re
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 
 from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from azure.search.documents import SearchClient
@@ -131,7 +133,12 @@ def breadcrumb_of(parent: dict) -> str:
     )
 
 
-def build_context(parents: list[dict]) -> str:
+def source_ids(parents: list[dict]) -> dict[str, dict]:
+    """Stable id per retrieved section — "S1", "S2" — in rank order."""
+    return {f"S{i}": parent for i, parent in enumerate(parents, 1)}
+
+
+def build_context(parents: list[dict], ids: dict[str, dict] | None = None) -> str:
     """
     Format parent chunks into a context block, grouped by policy document.
 
@@ -140,7 +147,14 @@ def build_context(parents: list[dict]) -> str:
     Presenting the sections as one flat list invites the model to merge rules
     from different policies into a single answer with the wrong numbers, so
     every section is labelled with the document it came from.
+
+    Each section also carries a short id, which the model returns to say which
+    ones it used. Reading the ids back is exact; inferring provenance from the
+    prose was not.
     """
+    ids = ids or source_ids(parents)
+    id_of = {id(parent): key for key, parent in ids.items()}
+
     by_document: dict[str, list[dict]] = {}
     for parent in parents:
         by_document.setdefault(parent.get("document_name") or "unknown", []).append(parent)
@@ -150,7 +164,8 @@ def build_context(parents: list[dict]) -> str:
         lines = [f"## Policy document: {document_name}"]
         for parent in items:
             breadcrumb = breadcrumb_of(parent)
-            lines.append(f"[{document_name} › {breadcrumb or 'General'}]\n{parent['content']}")
+            key = id_of.get(id(parent), "?")
+            lines.append(f"[{key}] {document_name} › {breadcrumb or 'General'}\n{parent['content']}")
         blocks.append("\n\n".join(lines))
     return "\n\n---\n\n".join(blocks)
 
@@ -158,6 +173,26 @@ def build_context(parents: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
+
+class GroundedAnswer(BaseModel):
+    """What the model returns: the answer, and which sections it used."""
+
+    answer: str = Field(
+        description="The answer in markdown, drawn only from the supplied sections."
+    )
+    sources_used: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of the sections the answer is based on, e.g. ['S3', 'S1'], "
+            "MOST IMPORTANT FIRST. The first id must be the section the answer "
+            "is chiefly drawn from. Omit sections only mentioned in passing. "
+            "Empty if the sections do not answer the question."
+        ),
+    )
+    sufficient: bool = Field(
+        default=True,
+        description="False when the supplied sections do not answer the question.",
+    )
 
 @dataclass
 class Source:
@@ -171,6 +206,8 @@ class Source:
     chars: int
     score: float = 0.0    # combined search score of this parent's matching chunks
     hits: int = 0         # how many of its child chunks matched
+    cited: bool = False   # the answer names this section as its source
+    cite_order: int = -1  # 0 = cited first in the answer, -1 = not cited
 
     def __str__(self) -> str:
         return (f"{self.section or '(no heading)'} "
@@ -201,6 +238,8 @@ class RagAnswer:
 
     answer: str
     query: str = ""
+    # False when the retrieved sections did not answer the question.
+    sufficient: bool = True
     # What retrieval actually searched on — differs from `query` when a
     # follow-up was condensed. Recorded so a bad answer can be traced to the
     # condenser or to the search, rather than guessed at.
@@ -217,6 +256,58 @@ class RagAnswer:
         lines = [self.answer, "", "Sources:"]
         lines += [f"  [{i}] {s}" for i, s in enumerate(self.sources, 1)]
         return "\n".join(lines)
+
+
+def generate(prompt: str) -> GroundedAnswer:
+    """
+    Ask for an answer plus the ids of the sections it used.
+
+    Structured output is tried strictly first, then via tool calling, and if
+    both fail the model is asked for plain prose. A schema problem should cost
+    the citations, never the answer.
+    """
+    for method in ("json_schema", "function_calling"):
+        try:
+            return chat_model().with_structured_output(
+                GroundedAnswer, method=method
+            ).invoke(prompt)
+        except Exception as exc:
+            print(f"      Structured output via {method} failed: "
+                  f"{type(exc).__name__}: {str(exc)[:120]}")
+
+    print("      Falling back to an unstructured answer — citations unavailable")
+    return GroundedAnswer(answer=chat_model().invoke(prompt).content, sources_used=[])
+
+
+def apply_citations(result: GroundedAnswer, ids: dict[str, dict],
+                    sources: list[Source]) -> list[Source]:
+    """
+    Mark the sections the model says it used, in the order it ranked them.
+
+    The model is given each section with a short id and returns the ids it used,
+    most important first, so provenance is read back exactly. Unknown ids are
+    ignored — a model can invent "S9" — and the order it gives is kept, because
+    an answer's opening source is what it is built on while later ones are
+    qualifications.
+    """
+    by_parent_path = {
+        parent.get("parent_path"): key for key, parent in ids.items()
+    }
+    key_of_source = {
+        source.parent_path: by_parent_path.get(source.parent_path) for source in sources
+    }
+
+    position = 0
+    for key in result.sources_used:
+        if key not in ids:
+            continue
+        for source in sources:
+            if key_of_source.get(source.parent_path) == key and not source.cited:
+                source.cited = True
+                source.cite_order = position
+                position += 1
+                break
+    return sources
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +409,7 @@ def answer_question(query: str, verbose: bool = False,
             answer="No relevant content found in the policy documents.",
             query=query,
             search_query=search_query,
+            sufficient=False,
         )
 
     if verbose:
@@ -325,7 +417,8 @@ def answer_question(query: str, verbose: bool = False,
         for source in sources:
             print(f"    - {source}")
 
-    context = build_context(parents)
+    ids = source_ids(parents)
+    context = build_context(parents, ids)
     conversation = format_history(history)
     conversation_block = (
         f"\nConversation so far (for resolving what the question refers to):\n"
@@ -333,30 +426,40 @@ def answer_question(query: str, verbose: bool = False,
         if conversation else ""
     )
 
-    llm = chat_model()
-
     prompt = f"""You are a helpful assistant answering questions about insurance policy documents.
-Answer the question using ONLY the policy context provided below.
-If the answer is not in the context, say "I don't have enough information to answer that."
+Answer the question using ONLY the policy sections provided below.
+If they do not answer it, say "I don't have enough information to answer that."
+and set sufficient to false.
 
-The context may come from more than one policy document, grouped below under
-"Policy document:" headings. When it does:
+Each section is labelled with an id in square brackets, e.g. [S1]. Report the
+ids you used in sources_used, most important first. The FIRST id must be the
+section that most directly answers the question — the one defining the cover or
+rule being asked about, not a section that merely adds a limit, an excess, an
+exclusion or a summary of it. Prefer the policy wording that grants or defines
+the cover over a summary document that restates it. Do not list sections you
+only mention in passing, and never invent an id.
+
+The sections may come from more than one policy document, grouped below under
+"Policy document:" headings. When they do:
 - Say which policy document each fact comes from.
 - If the documents give different answers, present them separately. Never merge
   rules from different policies into a single figure or procedure.
 
-Be concise and cite the document and section name where relevant.
+Be concise. Do not repeat the section ids in the answer text itself.
 {conversation_block}
-Context:
+Sections:
 {context}
 
-Question: {query}
+Question: {query}"""
 
-Answer:"""
-
-    response = llm.invoke(prompt)
-    return RagAnswer(answer=response.content, query=query,
-                     search_query=search_query, sources=sources)
+    result = generate(prompt)
+    return RagAnswer(
+        answer=result.answer,
+        query=query,
+        search_query=search_query,
+        sufficient=result.sufficient,
+        sources=apply_citations(result, ids, sources),
+    )
 
 
 # ---------------------------------------------------------------------------
